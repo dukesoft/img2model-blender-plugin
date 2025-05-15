@@ -1,0 +1,47 @@
+schema_version = "1.0.0"
+
+id = "img2model"
+version = "1.0.0"
+name = "Img2Model"
+tagline = "Generate 3D models from images"
+maintainer = "img2model <contact@img2model.com>"
+type = "add-on"
+
+# # Optional: link to documentation, support, source files, etc
+website = "https://img2model.com/"
+
+# # Optional: tag list defined by Blender and server, see:
+# # https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
+tags = ["3D View", "Add Mesh", "Import-Export"]
+
+blender_version_min = "3.0.0"
+
+# License conforming to https://spdx.org/licenses/ (use "SPDX: prefix)
+# https://docs.blender.org/manual/en/dev/advanced/extensions/licenses.html
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+"2025 img2model.com",
+]
+
+[permissions]
+network = "Need to upload images and download the results from the internet"
+files = "Select image files to upload, and temporarily store the results"
+
+# # Optional: advanced build settings.
+# # https://docs.blender.org/manual/en/dev/advanced/extensions/command_line_arguments.html#command-line-args-extension-build
+[build]
+# These are the default build excluded patterns.
+# You only need to edit them if you want different options.
+paths_exclude_pattern = [
+"__pycache__/",
+"/.git/",
+"/.venv/",
+"/.idea/",
+"/*.md",
+"/*.zip",
+"/.gitignore",
+"Makefile",
+]
