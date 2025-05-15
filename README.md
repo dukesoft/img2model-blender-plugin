@@ -2,6 +2,9 @@
 
 A plugin for blender to work with img2model.com - generate textured 3D models / meshes from images directly inside of blender. 
 
+## Installation & Usage
+Please visit [img2model.com/blender-plugin](https://img2model.com/blender-plugin) for instructions on how to use this plugin.
+
 ## Licence
 Copyright (C) 2025 img2model.com
 
