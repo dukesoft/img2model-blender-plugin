@@ -1,14 +1,16 @@
 bl_info = {
     "name": "Img2Model",
     "author": "img2model.com",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Image 2 Model",
     "description": "Generate 3D models from images",
     "category": "3D View",
 }
 
+import html
 import os
+import re
 import tempfile
 import threading
 import time
@@ -16,21 +18,79 @@ import time
 # Blender specifics
 import bpy
 import requests
-from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty
+from bpy.props import StringProperty, BoolProperty, IntProperty, EnumProperty
+
+API_URL_DEFAULT = "https://img2model.com/api"
+
+# The API asks for 3-10 seconds between status calls; hammering it does not make
+# the GPU any faster.
+POLL_INTERVAL = 3.0
+
+# How often the modal operator copies worker state into the UI.
+UI_INTERVAL = 0.25
+
+# new_job_form[mode] - a mode is a name for the texture settings, and it wins
+# over the individual switches it stands for, so it is the only texture field we
+# send.
+MODE_ITEMS = [
+    ('full_pbr', "Full PBR",
+     "Measured metallic and roughness on top of the colour. The best materials, and about twice the wait"),
+    ('simple_pbr', "Basic PBR",
+     "Colour plus a metallic/roughness map. The fastest way to a usable material"),
+    ('albedo_only', "Basic",
+     "Colour only, no material map. The honest option for photographs, where a guessed metallic map reads as dull chrome"),
+    ('textureless', "Textureless",
+     "Bare geometry, no colour at all. The fastest and cheapest option, and what you want for 3D printing"),
+]
+
+# new_job_form[detail] - how hard the generator works on the shape.
+DETAIL_ITEMS = [
+    ('1', "Draft", "Roughest shape, cheapest and quickest"),
+    ('2', "Fast", "Below standard detail"),
+    ('3', "Standard", "The default"),
+    ('4', "High", "More shape detail, longer wait"),
+    ('5', "Ultra", "The most shape detail, and the longest wait"),
+]
+
+# new_job_form[texture_size] - a step, not a pixel count.
+TEXTURE_SIZE_ITEMS = [
+    ('1', "1024 x 1024", "1024 x 1024 texture"),
+    ('2', "2048 x 2048", "2048 x 2048 texture"),
+    ('3', "4096 x 4096", "4096 x 4096 texture"),
+]
+
+
+def plain_text(message):
+    """API messages may carry HTML line breaks when they list validation errors."""
+    if not message:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", str(message))
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def resolve_image_path(image_path):
+    """Turn a Blender-relative // path into something open() understands."""
+    if image_path.startswith('//'):
+        return os.path.join(os.path.dirname(bpy.data.filepath), image_path[2:])
+    return image_path
+
 
 class Img2modelProperties(bpy.types.PropertyGroup):
     api_key: StringProperty(
         name="API Key",
-        description="Your API Key - if you don't have one, create it at img2model.com.",
-        default="12345"
+        description="Your API Key - if you don't have one, create it at img2model.com",
+        default="",
+        subtype='PASSWORD'
+    )
+    api_url: StringProperty(
+        name="API URL",
+        description="Base URL of the img2model API. Only change this if you were told to",
+        default=API_URL_DEFAULT
     )
     in_progress: BoolProperty(
         name="Processing",
         default=False
-    )
-    job_id: StringProperty(
-        name="Job ID",
-        default=""
     )
     status_message: StringProperty(
         name="Status Message",
@@ -38,33 +98,34 @@ class Img2modelProperties(bpy.types.PropertyGroup):
     )
     image_path: StringProperty(
         name="Image",
-        description="Select an image to upload",
+        description="Select an image to upload (png, jpeg, gif or webp, up to 20 MB)",
         subtype='FILE_PATH'
     )
-    detail_level: IntProperty(
+    mode: EnumProperty(
+        name="Model Type",
+        description="What kind of model you want - the one setting to change if you only change one",
+        items=MODE_ITEMS,
+        default='simple_pbr'
+    )
+    detail_level: EnumProperty(
         name="Detail Level",
-        description="Select the detail level required for this model",
-        default=3,
-        min=1,
-        max=5,
+        description="How hard the generator works on the shape. The single biggest lever on both price and wait",
+        items=DETAIL_ITEMS,
+        default='3'
     )
     poly_count: IntProperty(
-        name="Number of polygons",
-        description="Low-poly or high-poly model",
-        default=2000,
+        name="Polygons",
+        description="Target face count of the delivered mesh. It is a target, not a promise - results land within a few percent",
+        default=25000,
         min=1000,
-        max=100000,
+        max=1000000,
         step=1000
     )
-    remove_background: BoolProperty(
-        name="Remove Background",
-        description="Whether to remove the background from the image",
-        default=True
-    )
-    texture: BoolProperty(
-        name="Generate Texture",
-        description="Whether to generate texture for the 3D model",
-        default=True
+    texture_size: EnumProperty(
+        name="Texture Size",
+        description="Resolution of the generated texture. Your plan caps this",
+        items=TEXTURE_SIZE_ITEMS,
+        default='2'
     )
 
 
@@ -81,226 +142,293 @@ class Img2modelPanel(bpy.types.Panel):
         layout.prop(props, "api_key")
         layout.prop(props, "image_path")
 
+        layout.separator()
+
+        layout.prop(props, "mode")
         layout.prop(props, "detail_level")
         layout.prop(props, "poly_count")
 
-        layout.prop(props, "remove_background")
-        layout.prop(props, "texture")
+        row = layout.row()
+        row.enabled = props.mode != 'textureless'
+        row.prop(props, "texture_size")
+
+        layout.separator()
 
         row = layout.row()
         row.enabled = not props.in_progress
-        row.operator("object.generate_3d")
+        row.operator("object.generate_3d", icon='SHADERFX')
 
         if props.in_progress:
-            if props.status_message:
-                for line in props.status_message.split("\n"):
-                    layout.label(text=line)
-            else:
-                layout.label("Processing...")
+            box = layout.box()
+            for line in (props.status_message or "Processing...").split("\n"):
+                box.label(text=line)
+            box.label(text="Press ESC to stop watching this job", icon='INFO')
+
+        header, body = layout.panel("img2model_advanced", default_closed=True)
+        header.label(text="Advanced")
+        if body:
+            body.prop(props, "api_url")
+
 
 class Img2modelOperator(bpy.types.Operator):
     bl_idname = "object.generate_3d"
     bl_label = "Generate 3D Model"
-    bl_description = "Generate a 3D model from text description, an image or a selected mesh"
+    bl_description = "Generate a 3D model from the selected image"
 
     debug = False
 
-    # parameters
-    job_id = ''
-    api_url = "https://img2model.com/api"
-    api_key = ""
-    image_path = ""
-    detail_level = 3
-    poly_count = 2000
-    remove_background = False
-    texture = False
-
-    # references
-    _area = None
-    worker = None
-    finalized = False
-
-    def modal(self, context, event):
-        if event.type in {'RIGHTMOUSE', 'ESC'}:
-            return {'CANCELLED'}
-
-        if self.finalized:
-            print("Modal finalized")
-            self.finalized = False
-            context.scene.img2model.in_progress = False
-
-        return {'PASS_THROUGH'}
-
     def invoke(self, context, event):
         props = context.scene.img2model
-        self.api_key = props.api_key
-        self.image_path = props.image_path
-        self.detail_level = props.detail_level
-        self.poly_count = props.poly_count
-        self.remove_background = props.remove_background
-        self.texture = props.texture
-        self._area = context.area
 
         if not bpy.app.online_access:
-            self.report({'WARNING'}, "Online access is disabled in your Blender settings. Internet access is required for this plugin to work.")
-            return {'FINISHED'}
+            self.report({'WARNING'}, "Online access is disabled in your Blender settings. "
+                                     "Internet access is required for this plugin to work.")
+            return {'CANCELLED'}
 
-        if self.image_path == "":
+        if props.in_progress:
+            self.report({'WARNING'}, "A job is already running.")
+            return {'CANCELLED'}
+
+        if not props.api_key.strip():
+            self.report({'WARNING'}, "Please enter your API key. You can create one at img2model.com.")
+            return {'CANCELLED'}
+
+        if not props.image_path:
             self.report({'WARNING'}, "Please select an image first.")
-            return {'FINISHED'}
+            return {'CANCELLED'}
+
+        image_path = resolve_image_path(props.image_path)
+        if not os.path.isfile(image_path):
+            self.report({'WARNING'}, f"Image does not exist: {image_path}")
+            return {'CANCELLED'}
+
+        # Everything the worker thread needs, read on the main thread. The
+        # thread never touches bpy - it only writes the plain attributes below,
+        # which modal() copies into the properties.
+        self._api_url = props.api_url.strip().rstrip('/') or API_URL_DEFAULT
+        self._api_key = props.api_key.strip()
+        self._image_path = image_path
+        self._poly_count = props.poly_count
+        self._fields = {
+            "new_job_form[mode]": props.mode,
+            "new_job_form[detail]": props.detail_level,
+            "new_job_form[polycount]": str(props.poly_count),
+            "new_job_form[format]": "glb",
+        }
+        # texture_size is ignored for a job without textures.
+        if props.mode != 'textureless':
+            self._fields["new_job_form[texture_size]"] = props.texture_size
+
+        self._status = "Submitting job to img2model..."
+        self._error = None
+        self._info = None
+        self._credits = None
+        self._result_file = None
+        self._done = False
+        self._cancelled = False
+        self._area = context.area
 
         props.in_progress = True
-
-        # proper filepath handling
-        blend_file_dir = os.path.dirname(bpy.data.filepath)
-        if self.image_path.startswith('//'):
-            self.image_path = self.image_path[2:]
-            self.image_path = os.path.join(blend_file_dir, self.image_path)
+        props.status_message = self._status
 
         if self.debug:
-            self.report({'INFO'}, f"filepath={blend_file_dir}")
-            self.report({'INFO'}, f"opening file at {self.image_path}")
+            print(f"[img2model] posting {self._fields} with {self._image_path}")
 
-        props.status_message = f"Submitting job to img2model..."
-
-        self.worker = threading.Thread(target=self.generate_model, args=[context])
-        self.worker.start()
+        self._worker = threading.Thread(target=self.run_job, daemon=True)
+        self._worker.start()
 
         wm = context.window_manager
+        self._timer = wm.event_timer_add(UI_INTERVAL, window=context.window)
         wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
-    def failedState(self, context, message):
-        self.report({'ERROR'}, f"Generation failed: {message}")
-        self.finalized = True
+    def modal(self, context, event):
+        props = context.scene.img2model
+
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self._cancelled = True
+            self.report({'INFO'}, "Stopped watching the job. It keeps running on img2model.com.")
+            self.discard_result()
+            return self.finish(context)
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if props.status_message != self._status:
+            props.status_message = self._status
+            if self._area:
+                self._area.tag_redraw()
+
+        if not self._done:
+            return {'PASS_THROUGH'}
+
+        if self._error:
+            self.report({'ERROR'}, self._error)
+        else:
+            # Importing touches bpy, so it happens here on the main thread.
+            try:
+                bpy.ops.import_scene.gltf(filepath=self._result_file)
+                summary = self._info or "Model imported."
+                if self._credits is not None:
+                    summary += f" {self._credits} credits left."
+                self.report({'INFO'}, summary)
+            except Exception as exception:
+                self.report({'ERROR'}, f"Could not import the generated model: {exception}")
+            finally:
+                self.discard_result()
+
+        return self.finish(context)
+
+    def discard_result(self):
+        """Remove the downloaded file, once it has been imported or given up on."""
+        if not self._result_file:
+            return
+        try:
+            os.unlink(self._result_file)
+        except OSError:
+            pass
+        self._result_file = None
+
+    def finish(self, context):
+        wm = context.window_manager
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+
         props = context.scene.img2model
         props.in_progress = False
-        self._area.tag_redraw()
-        raise Exception(f'Generation failed: {message}')
+        props.status_message = ""
+        if self._area:
+            self._area.tag_redraw()
 
-    def generate_model(self, context):
-        self.report({'INFO'}, f"Submitting job")
-        props = context.scene.img2model
+        return {'FINISHED'}
 
+    def fail(self, message):
+        """Called from the worker thread only."""
+        self._error = plain_text(message)
+        self._done = True
+
+    def api_post(self, path, **kwargs):
+        return requests.post(f"{self._api_url}/{path}", timeout=120, **kwargs)
+
+    def run_job(self):
+        """Runs on the worker thread. Must not touch bpy."""
         try:
-            if not os.path.exists(self.image_path):
-                self.report({'ERROR'}, f"Image path does not exist {self.image_path}")
-                raise Exception(f'Image path does not exist {self.image_path}')
-            self.report({'INFO'}, f"Post Start Image to 3D")
+            job_id = self.submit_job()
+            if job_id is None:
+                return
 
-            response = requests.post(
-                f"{self.api_url}/jobs/new",
-                data={
-                    "api_key": self.api_key,
-                    "new_job_form[detail]": self.detail_level,
-                    "new_job_form[smoothness]": self.poly_count,
-                    "new_job_form[auto_texture]": "on" if self.texture else "off",
-                    "new_job_form[remove_background]": "on" if self.remove_background else "off",
-                    "new_job_form[format]": "glb",
-                },
-                files={
-                    "new_job_form[image]": open(self.image_path, "rb"),
-                }
+            if not self.wait_for_job(job_id):
+                return
+
+            self.download_result(job_id)
+
+        except requests.RequestException as exception:
+            self.fail(f"Could not reach the img2model API: {exception}")
+        except Exception as exception:
+            self.fail(f"Error handling job: {exception}")
+
+    def submit_job(self):
+        """Returns the job id, or None once the failure has been recorded."""
+        with open(self._image_path, "rb") as image:
+            response = self.api_post(
+                "jobs/new",
+                data=dict(self._fields, api_key=self._api_key),
+                files={"new_job_form[image]": image},
             )
 
-            self.report({'INFO'}, f"Submitted job")
-            if self.debug:
-                self.report({'INFO'}, f"Result (text): {response.text}")
+        # A non-2xx status is a transport problem; `success` is the verdict.
+        if response.status_code != 200:
+            self.fail(f"Error submitting job ({response.status_code}): {response.text}")
+            return None
 
+        result = response.json()
+        if self.debug:
+            print(f"[img2model] submit response: {result}")
+
+        if not result.get("success"):
+            self.fail(result.get("message") or "The job was refused.")
+            return None
+
+        # Kept for the summary at the end - the first poll overwrites _status.
+        self._credits = result.get("remaining_credits")
+        self._status = "Job accepted, waiting for a GPU..."
+
+        return result.get("job_id")
+
+    def wait_for_job(self, job_id):
+        """Blocks until the job stops changing. False once a failure is recorded."""
+        waited = 0
+        while not self._cancelled:
+            time.sleep(POLL_INTERVAL)
+            waited += POLL_INTERVAL
+
+            response = self.api_post(f"jobs/status/{job_id}", data={"api_key": self._api_key})
             if response.status_code != 200:
-                return self.failedState(context, f"Error submitting job: {response.status_code}: {response.text}")
+                self.fail(f"Error checking job state ({response.status_code}): {response.text}")
+                return False
 
-            resp_json = response.json()
+            state = response.json()
             if self.debug:
-                self.report({'INFO'}, f"Result (decoded): {resp_json}")
+                print(f"[img2model] status response: {state}")
 
-            if not resp_json["success"]:
-                return self.failedState(context, resp_json["message"])
+            # When the status endpoint rejects the key it answers in the
+            # submission shape, so `finished` is missing rather than null -
+            # success has to be checked before anything else.
+            if not state.get("success"):
+                self.fail(state.get("message") or "Could not read the job state.")
+                return False
 
-            # job submitted succesfully, get job ID
-            props.status_message = resp_json["message"]
-            job_id = resp_json["job_id"]
-            self.report({'INFO'}, f"Job ID: {job_id}")
+            # `finished` is true for FAILED and REJECTED as well, so the loop
+            # exits on it and the state is judged separately.
+            if not state.get("finished"):
+                self._status = f"{state.get('state_hr') or 'Working'}... ({int(waited)}s)"
+                continue
 
-            pstring = "."
+            if state.get("state") == "COMPLETED":
+                faces = state.get("faces")
+                if faces and faces < self._poly_count * 0.5:
+                    self._info = (f"Generated {faces} faces, well short of the {self._poly_count} requested - "
+                                  f"the result may be thin.")
+                self._status = "Downloading model..."
+                return True
 
-            while True:
-                time.sleep(1)
-                pstring += "."
-                if len(pstring) > 3:
-                    pstring = "."
+            self.fail(f"Job did not complete: {state.get('state_hr') or state.get('state')} "
+                      f"({plain_text(state.get('message')) or 'no reason given'})")
+            return False
 
-                jobstate = requests.post(
-                    f"{self.api_url}/jobs/status/{job_id}",
-                    data={
-                        "api_key": self.api_key,
-                    }
-                )
-                if jobstate.status_code != 200:
-                    return self.failedState(context, f"Error checking job state: {jobstate.status_code}: {jobstate.text}")
-                jobstate_json = jobstate.json()
-                if self.debug:
-                    self.report({'INFO'}, f"Result (decoded): {jobstate_json}")
+        return False
 
-                if not jobstate_json["success"]:
-                    msg = jobstate_json["message"]
-                    return self.failedState(context, f"Failure checking job state: {msg}")
+    def download_result(self, job_id):
+        response = self.api_post(f"jobs/result/{job_id}", data={"api_key": self._api_key})
 
-                if not jobstate_json["finished"]:
-                    props.status_message = jobstate_json["state_hr"] + pstring
-                    self._area.tag_redraw()
-                    continue
+        if response.status_code != 200:
+            self.fail(f"Error fetching job result ({response.status_code}): {response.text}")
+            return
 
-                if jobstate_json["state"] == "COMPLETED":
-                    return self.handlejobCompleted(context, job_id)
+        # A job that is not finished - or not yours - gets a JSON refusal
+        # instead of the model, so check before writing the body to disk.
+        if response.content[:1] == b"{":
+            try:
+                message = response.json().get("message")
+            except ValueError:
+                message = None
+            self.fail(message or "The API refused to hand over the result.")
+            return
 
-                statemsg = jobstate_json["state_hr"]
-                msg = jobstate_json["message"]
-                return self.failedState(context, f"Job did not complete: {statemsg} ({msg})")
-
-        except Exception as e:
-            return self.failedState(context, f"Error handling job: {e}")
-
-        return self.failedState(context, f"Unhandled job state")
-
-    def handlejobCompleted(self, context, job_id):
-        try:
-            # download to temp file
-            response = requests.post(
-                f"{self.api_url}/jobs/result/{job_id}",
-                data={
-                    "api_key": self.api_key,
-                }
-            )
-
-            if response.status_code != 200:
-                return self.failedState(context, f"Error fetching job data: {str(response.status_code)}: {response.text}")
-
-            tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as tmpfile:
             tmpfile.write(response.content)
-            tmpfile.close()
+            self._result_file = tmpfile.name
 
-            # Import the GLB file in the main worker
-            def importFile():
-                bpy.ops.import_scene.gltf(filepath=tmpfile.name)
-                os.unlink(tmpfile.name)
-                return None
+        self._done = True
 
-            bpy.app.timers.register(importFile)
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Error: {str(e)}")
-
-        finally:
-            self.finalized = True
-            props = context.scene.img2model
-            props.in_progress = False
 
 classes = (
     Img2modelProperties,
     Img2modelOperator,
     Img2modelPanel,
 )
+
 
 def register():
     for cls in classes:

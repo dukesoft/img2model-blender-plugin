@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "img2model"
-version = "1.0.0"
+version = "1.1.0"
 name = "Img2Model"
 tagline = "Generate 3D models from images"
 maintainer = "img2model <contact@img2model.com>"
