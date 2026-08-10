@@ -2,7 +2,7 @@ bl_info = {
     "name": "Img2Model",
     "author": "img2model.com",
     "version": (1, 1),
-    "blender": (3, 0, 0),
+    "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Image 2 Model",
     "description": "Generate 3D models from images",
     "category": "3D View",
